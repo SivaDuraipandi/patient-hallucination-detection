@@ -97,6 +97,19 @@ def format_duration(seconds):
     return f"{minutes:02d}:{secs:02d}"
 
 
+def to_python_types(obj):
+    """Recursively convert NumPy scalars to JSON-safe Python types."""
+    if isinstance(obj, dict):
+        return {k: to_python_types(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [to_python_types(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [to_python_types(v) for v in obj]
+    if isinstance(obj, np.generic):
+        return obj.item()
+    return obj
+
+
 # ─────────────────────────────────────────────────────────────
 # DATASET CLASS
 # ─────────────────────────────────────────────────────────────
@@ -401,6 +414,7 @@ def save_checkpoint(model, tokenizer, epoch,
         "alpha"        : ALPHA,
         "patient_chars": PATIENT_CHARS,
     }
+    checkpoint_meta = to_python_types(checkpoint_meta)
 
     # Always save latest
     latest_path = os.path.join(OUTPUTS_DIR, "latest_model")
@@ -440,11 +454,11 @@ def save_checkpoint(model, tokenizer, epoch,
             os.path.join(best_path, "best_metrics.json"),
             "w"
         ) as f:
-            json.dump({
+            json.dump(to_python_types({
                 "epoch"      : epoch,
                 "val_metrics": val_metrics,
                 "saved_at"   : datetime.now().isoformat()
-            }, f, indent=2)
+            }), f, indent=2)
 
         print(f"  Best model saved → outputs/best_model/")
 
@@ -607,7 +621,7 @@ def train():
             LOGS_DIR, "training_log.json"
         )
         with open(log_path, "w") as f:
-            json.dump(training_log, f, indent=2)
+            json.dump(to_python_types(training_log), f, indent=2)
 
     # ── Final summary ─────────────────────────────────────────
     log("TRAINING COMPLETE")
