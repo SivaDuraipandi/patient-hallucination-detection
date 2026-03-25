@@ -1,0 +1,17 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.env
+
+logs/
+outputs/
+notebooks/
+
+data/raw/
+data/combined/
+
+.DS_Store
+Thumbs.db
