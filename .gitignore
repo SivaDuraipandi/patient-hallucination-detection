@@ -3,6 +3,9 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+backend/__pycache__/
+backend/routes/__pycache__/
+backend/services/__pycache__/
 
 .env
 
@@ -12,6 +15,9 @@ notebooks/
 
 data/raw/
 data/combined/
+
+frontend/node_modules/
+frontend/dist/
 
 .DS_Store
 Thumbs.db

@@ -61,7 +61,7 @@ os.makedirs(LOGS_DIR,    exist_ok=True)
 # ── Config ────────────────────────────────────────────────────
 MODEL_NAME    = "microsoft/MiniLM-L12-H384-uncased"
 MODEL_LABEL   = "MiniLM-L12-H384"
-MAX_LEN       = 256
+MAX_LEN       = 384
 BATCH_SIZE    = 2
 EPOCHS        = 2
 LR            = 2e-5
@@ -70,7 +70,7 @@ WEIGHT_DECAY  = 0.01
 DROPOUT       = 0.3
 ALPHA         = 0.7    # weight for classification loss
 RANDOM_SEED   = 42
-PATIENT_CHARS = 200    # chars of patient context to include
+PATIENT_CHARS = 500    # chars of patient context to include
 HEAD_HIDDEN   = 128
 
 torch.manual_seed(RANDOM_SEED)

@@ -151,6 +151,8 @@ def build_pairs(matched_df):
                 row.get("cosine_similarity", 0.0)),
             "bridge_cosine"       : float(
                 row.get("bridge_cosine", 0.0)),
+            "match_confidence"    : str(
+                row.get("match_confidence", "unknown")),
         }
 
         # Validate minimum field lengths
@@ -409,6 +411,8 @@ def save_dataset_report(full_df, train_df,
             "hallucination_type"].value_counts().to_dict(),
         "match_type_distribution": full_df[
             "match_type"].value_counts().to_dict(),
+        "match_confidence_distribution": full_df[
+            "match_confidence"].value_counts().to_dict(),
         "pmid_bridge_records"   : len(pmid_rows),
         "semantic_records"      : len(sem_rows),
         "patient_gender_dist"   : full_df[
@@ -432,6 +436,7 @@ def save_dataset_report(full_df, train_df,
             "hallucination_type"  : "Category of hallucination",
             "trust_score"         : "Confidence target (0.3/0.6/0.9/1.0)",
             "match_type"          : "pmid_semantic_bridge / semantic_fallback",
+            "match_confidence"    : "high / medium / low match quality tier",
             "cosine_similarity"   : "Patient match cosine score",
             "bridge_cosine"       : "PMID bridge cosine score (Stage 1 only)",
         }
@@ -458,6 +463,8 @@ def save_dataset_report(full_df, train_df,
           f"{report['trust_score_distribution']}")
     print(f"  Halluc types       : "
           f"{report['hallucination_types']}")
+    print(f"  Match confidence   : "
+          f"{report['match_confidence_distribution']}")
     print(f"  PMID-bridge pairs  : {report['pmid_bridge_records']:,}")
     print(f"  Semantic pairs     : {report['semantic_records']:,}")
     print(f"  Random assignment  : False")

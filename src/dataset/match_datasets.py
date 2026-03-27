@@ -23,6 +23,7 @@ Fixed seed 42 only for PMC sample selection.
 
 Output:
   data/combined/matched_pairs.jsonl
+  data/combined/review_pairs.jsonl
   data/combined/match_report.json
 """
 
@@ -44,6 +45,8 @@ os.makedirs(COMBINED_DIR, exist_ok=True)
 # ── Config ────────────────────────────────────────────────────
 SEMANTIC_SAMPLE       = 15000
 PMID_BRIDGE_THRESHOLD = 0.75
+SEMANTIC_ACCEPT_THRESHOLD = 0.50
+SEMANTIC_REVIEW_THRESHOLD = 0.40
 RANDOM_SEED           = 42
 np.random.seed(RANDOM_SEED)
 
@@ -52,6 +55,24 @@ def log(msg):
     print(f"\n{'='*55}")
     print(f"  {msg}")
     print(f"{'='*55}")
+
+
+def classify_match_confidence(match_type, patient_score, bridge_score=0.0):
+    """Assign a simple confidence tier for downstream filtering/reporting."""
+    if match_type == "pmid_semantic_bridge":
+        if patient_score >= 0.75 and bridge_score >= 0.90:
+            return "high"
+        return "medium"
+
+    if patient_score >= 0.65:
+        return "high"
+    if patient_score >= 0.55:
+        return "medium"
+    if patient_score >= SEMANTIC_ACCEPT_THRESHOLD:
+        return "low"
+    if patient_score >= SEMANTIC_REVIEW_THRESHOLD:
+        return "review"
+    return "reject"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -513,6 +534,7 @@ def build_matched_pairs(mh_df, matched_rows, match_types,
     log("Building matched_pairs.jsonl...")
 
     records = []
+    review_records = []
     skipped = 0
 
     for i, (_, mh_row) in enumerate(mh_df.iterrows()):
@@ -521,9 +543,38 @@ def build_matched_pairs(mh_df, matched_rows, match_types,
             skipped += 1
             continue
 
-        # Filter low-quality semantic fallback pairs
-        if (match_types[i] == "semantic_fallback"
-                and match_scores[i] < 0.25):
+        match_confidence = classify_match_confidence(
+            match_types[i],
+            match_scores[i],
+            bridge_scores[i],
+        )
+
+        # Keep borderline semantic matches for manual review instead
+        # of mixing them into the training pool.
+        if match_confidence == "review":
+            review_records.append({
+                "matched_patient_uid": str(
+                    pmc_row.get("patient_uid", "")),
+                "patient_context": str(
+                    pmc_row.get("patient", "")),
+                "question": str(mh_row.get("question", "")),
+                "ground_truth": str(
+                    mh_row.get("ground_truth", "")),
+                "hallucinated_ans": str(
+                    mh_row.get("hallucinated_ans", "")),
+                "difficulty": str(
+                    mh_row.get("difficulty", "unknown")),
+                "match_type": match_types[i],
+                "match_pmid": match_pmids[i],
+                "cosine_similarity": match_scores[i],
+                "bridge_cosine": bridge_scores[i],
+                "match_confidence": match_confidence,
+                "review_recommendation": "manual_review",
+            })
+            skipped += 1
+            continue
+
+        if match_confidence == "reject":
             skipped += 1
             continue
 
@@ -561,20 +612,28 @@ def build_matched_pairs(mh_df, matched_rows, match_types,
             "match_pmid"        : match_pmids[i],
             "cosine_similarity" : match_scores[i],
             "bridge_cosine"     : bridge_scores[i],
+            "match_confidence"  : match_confidence,
         }
         records.append(record)
 
     matched_df = pd.DataFrame(records)
+    review_df  = pd.DataFrame(review_records)
     out_path   = os.path.join(
         COMBINED_DIR, "matched_pairs.jsonl"
     )
+    review_path = os.path.join(
+        COMBINED_DIR, "review_pairs.jsonl"
+    )
     matched_df.to_json(out_path, orient="records", lines=True)
+    review_df.to_json(review_path, orient="records", lines=True)
 
     print(f"  Saved   : {out_path}")
+    print(f"  Review  : {review_path}")
     print(f"  Rows    : {len(matched_df):,}")
+    print(f"  Review  : {len(review_df):,}")
     if skipped > 0:
         print(f"  Skipped : {skipped} "
-              f"(low quality cosine < 0.25)")
+              f"(review/rejected semantic matches)")
     return matched_df
 
 
@@ -605,15 +664,19 @@ def save_match_report(matched_df):
 
     report = {
         "total_pairs"                  : len(matched_df),
-        "matching_version"             : "V3_colon_score_fix",
+        "matching_version"             : "V4_confidence_filtering",
         "random_assignment_used"       : False,
         "matching_method"              : (
             "3-stage: semantic PMID bridge "
             "(MedHallu→PubMedQA cosine>=0.75, "
             "colon-score PMID parsing) → "
             "PMID cosine-best patient → "
-            "semantic fallback (all-MiniLM-L6-v2)"
+            "semantic fallback (all-MiniLM-L6-v2) "
+            f"with accept>={SEMANTIC_ACCEPT_THRESHOLD} "
+            f"and review>={SEMANTIC_REVIEW_THRESHOLD}"
         ),
+        "semantic_accept_threshold"    : SEMANTIC_ACCEPT_THRESHOLD,
+        "semantic_review_threshold"    : SEMANTIC_REVIEW_THRESHOLD,
         "pmid_bridge_count"            : len(pmid_rows),
         "pmid_bridge_pct"              : round(
             len(pmid_rows) / len(matched_df) * 100, 2),
@@ -629,6 +692,8 @@ def save_match_report(matched_df):
         "semantic_max_cosine"          : sm_max,
         "difficulty_distribution"      : matched_df[
             "difficulty"].value_counts().to_dict(),
+        "match_confidence_distribution": matched_df[
+            "match_confidence"].value_counts().to_dict(),
         "split_source_distribution"    : matched_df[
             "split_source"].value_counts().to_dict(),
         "trust_score_distribution"     : matched_df[
@@ -659,6 +724,12 @@ def save_match_report(matched_df):
           f"{report['semantic_mean_cosine']}")
     print(f"    Min  patient cosine    : "
           f"{report['semantic_min_cosine']}")
+    print(f"    Accept threshold       : "
+          f"{report['semantic_accept_threshold']}")
+    print(f"    Review threshold       : "
+          f"{report['semantic_review_threshold']}")
+    print(f"\n  Confidence tiers        : "
+          f"{report['match_confidence_distribution']}")
     print(f"\n  Random assignment        : False")
     print(f"\n  ── Paper methodology statement ─────────────")
     print(f"  Patient records matched using 3-stage")
@@ -680,8 +751,8 @@ def save_match_report(matched_df):
 # ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("\nPatient-Aware Hallucination Detection")
-    print("Dataset Matching — V3 (Colon-Score PMID Fix)")
-    print("Strategy : 3-stage fully deterministic")
+    print("Dataset Matching — V4 (Confidence Filtering)")
+    print("Strategy : 3-stage deterministic + stricter filtering")
 
     pmc_df, mh_df, pubmed_df = load_datasets()
     encoder                  = load_encoder()
@@ -701,6 +772,7 @@ if __name__ == "__main__":
 
     log("MATCHING V3 COMPLETE")
     print(f"  data/combined/matched_pairs.jsonl")
+    print(f"  data/combined/review_pairs.jsonl")
     print(f"  data/combined/match_report.json")
     print(f"\n  Next step:")
     print(f"    python src/dataset/build_combined.py")
