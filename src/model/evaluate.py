@@ -1,24 +1,23 @@
 """
 evaluate.py
 ===========
-Loads the saved best MiniLM checkpoint and evaluates it on the
-held-out test split for final paper-ready metrics.
+Builds confidence-based trust artifacts from train/validation splits
+and evaluates the saved best checkpoint on the held-out test split.
 
 Outputs:
   logs/test_metrics.json
   logs/test_predictions.jsonl
+  outputs/best_model/trust_config.json
+  outputs/best_model/embedding_index.npz
 """
 
-import os
 import json
+import os
+
 import numpy as np
 import pandas as pd
-
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
-
-from transformers import AutoTokenizer
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
@@ -27,7 +26,10 @@ from sklearn.metrics import (
     mean_squared_error,
     precision_score,
     recall_score,
+    roc_auc_score,
 )
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer
 
 from train import (
     BATCH_SIZE,
@@ -42,35 +44,174 @@ from train import (
     log,
     to_python_types,
 )
+from trust_utils import (
+    compose_trust_score,
+    compute_selective_accuracy,
+    expected_calibration_error,
+    find_abstention_threshold,
+    fit_temperature,
+    multiclass_brier_score,
+    neighbor_trust_scores,
+    predictive_entropy,
+    save_embedding_index,
+    save_trust_config,
+    softmax_probs,
+)
 
 
 BEST_MODEL_DIR = os.path.join(OUTPUTS_DIR, "best_model")
+TRAIN_PATH = os.path.join(SPLITS_DIR, "train.jsonl")
+VAL_PATH = os.path.join(SPLITS_DIR, "val.jsonl")
 TEST_PATH = os.path.join(SPLITS_DIR, "test.jsonl")
+TRUST_CONFIG_PATH = os.path.join(BEST_MODEL_DIR, "trust_config.json")
+EMBED_INDEX_PATH = os.path.join(BEST_MODEL_DIR, "embedding_index.npz")
+NEIGHBOR_K = 15
+MIN_COVERAGE = 0.85
+TRUST_WEIGHTS = {
+    "calibrated_probability": 0.55,
+    "neighbor_trust": 0.25,
+    "uncertainty_penalty": 0.20,
+}
 
 
-def load_test_split():
-    log("Loading held-out test split...")
-    if not os.path.exists(TEST_PATH):
-        raise FileNotFoundError(
-            f"Test split not found at {TEST_PATH}."
-        )
+def load_split(path, label):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"{label} split not found at {path}.")
 
-    test_df = pd.read_json(TEST_PATH, lines=True)
+    df = pd.read_json(path, lines=True)
     required = [
-        "patient_context", "question", "answer",
-        "is_hallucinated", "trust_score"
+        "matched_patient_uid",
+        "patient_context",
+        "question",
+        "answer",
+        "is_hallucinated",
+        "trust_score",
     ]
     for col in required:
-        if col not in test_df.columns:
-            raise ValueError(
-                f"Missing column '{col}' in test.jsonl."
+        if col not in df.columns:
+            raise ValueError(f"Missing column '{col}' in {label}.")
+
+    return df
+
+
+def run_model(model, loader):
+    logits_rows = []
+    trust_rows = []
+    feature_rows = []
+    label_rows = []
+
+    model.eval()
+    with torch.no_grad():
+        for batch in loader:
+            input_ids = batch["input_ids"].to(DEVICE)
+            attn_mask = batch["attention_mask"].to(DEVICE)
+            labels = batch["label"].to(DEVICE)
+
+            logits, trust_pred, features = model(
+                input_ids, attn_mask, return_features=True
             )
 
-    print(f"  Test rows : {len(test_df):,}")
-    return test_df
+            logits_rows.append(logits.cpu().numpy())
+            trust_rows.append(trust_pred.cpu().numpy())
+            feature_rows.append(features.cpu().numpy())
+            label_rows.append(labels.cpu().numpy())
+
+    return {
+        "logits": np.concatenate(logits_rows, axis=0),
+        "trust_pred": np.concatenate(trust_rows, axis=0),
+        "features": np.concatenate(feature_rows, axis=0),
+        "labels": np.concatenate(label_rows, axis=0),
+    }
 
 
-def compute_test_metrics(labels, preds, trusts, trust_preds):
+def prepare_trust_artifacts(model, tokenizer):
+    log("Preparing trust artifacts from train/validation splits...")
+
+    train_df = load_split(TRAIN_PATH, "train.jsonl")
+    val_df = load_split(VAL_PATH, "val.jsonl")
+
+    train_loader = DataLoader(
+        HallucinationDataset(train_df, tokenizer),
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=0,
+    )
+    val_loader = DataLoader(
+        HallucinationDataset(val_df, tokenizer),
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=0,
+    )
+
+    train_outputs = run_model(model, train_loader)
+    val_outputs = run_model(model, val_loader)
+
+    temperature = fit_temperature(
+        val_outputs["logits"], val_outputs["labels"]
+    )
+    val_probs = softmax_probs(val_outputs["logits"], temperature)
+    val_preds = val_probs.argmax(axis=1)
+    val_uncertainty = predictive_entropy(val_probs)
+    val_neighbor = neighbor_trust_scores(
+        val_outputs["features"],
+        train_outputs["features"],
+        train_outputs["labels"],
+        k=NEIGHBOR_K,
+    )
+    abstain = find_abstention_threshold(
+        val_probs,
+        val_outputs["labels"],
+        min_coverage=MIN_COVERAGE,
+    )
+
+    save_embedding_index(
+        EMBED_INDEX_PATH,
+        train_outputs["features"],
+        train_outputs["labels"],
+    )
+
+    trust_config = {
+        "temperature": round(float(temperature), 6),
+        "neighbor_k": NEIGHBOR_K,
+        "min_coverage": MIN_COVERAGE,
+        "abstention": abstain,
+        "weights": TRUST_WEIGHTS,
+        "validation_metrics": {
+            "ece": round(
+                expected_calibration_error(
+                    val_probs, val_outputs["labels"]
+                ),
+                4,
+            ),
+            "brier": round(
+                multiclass_brier_score(
+                    val_probs, val_outputs["labels"]
+                ),
+                4,
+            ),
+            "mean_uncertainty": round(
+                float(val_uncertainty.mean()), 4
+            ),
+            "mean_neighbor_trust": round(
+                float(val_neighbor.mean()), 4
+            ),
+            "accuracy": round(
+                float(
+                    accuracy_score(
+                        val_outputs["labels"], val_preds
+                    )
+                ),
+                4,
+            ),
+        },
+    }
+    save_trust_config(TRUST_CONFIG_PATH, trust_config)
+    print(f"  Saved trust config : {TRUST_CONFIG_PATH}")
+    print(f"  Saved embed index  : {EMBED_INDEX_PATH}")
+    return train_outputs, trust_config
+
+
+def compute_test_metrics(labels, preds, trusts, trust_preds, probs):
     acc = accuracy_score(labels, preds)
     f1 = f1_score(labels, preds, average="binary", zero_division=0)
     prec = precision_score(
@@ -82,6 +223,7 @@ def compute_test_metrics(labels, preds, trusts, trust_preds):
     mse = mean_squared_error(trusts, trust_preds)
     mae = mean_absolute_error(trusts, trust_preds)
     rmse = float(np.sqrt(mse))
+    roc_auc = roc_auc_score(labels, probs[:, 1])
 
     tn, fp, fn, tp = confusion_matrix(
         labels, preds, labels=[0, 1]
@@ -89,14 +231,21 @@ def compute_test_metrics(labels, preds, trusts, trust_preds):
     specificity = tn / max(tn + fp, 1)
 
     return {
-        "accuracy": round(acc, 4),
-        "f1": round(f1, 4),
-        "precision": round(prec, 4),
-        "recall": round(rec, 4),
-        "specificity": round(specificity, 4),
-        "trust_mse": round(mse, 4),
-        "trust_mae": round(mae, 4),
-        "trust_rmse": round(rmse, 4),
+        "accuracy": round(float(acc), 4),
+        "f1": round(float(f1), 4),
+        "precision": round(float(prec), 4),
+        "recall": round(float(rec), 4),
+        "specificity": round(float(specificity), 4),
+        "trust_mse": round(float(mse), 4),
+        "trust_mae": round(float(mae), 4),
+        "trust_rmse": round(float(rmse), 4),
+        "roc_auc": round(float(roc_auc), 4),
+        "ece": round(
+            expected_calibration_error(probs, labels), 4
+        ),
+        "brier": round(
+            multiclass_brier_score(probs, labels), 4
+        ),
         "confusion_matrix": {
             "tn": int(tn),
             "fp": int(fp),
@@ -106,84 +255,85 @@ def compute_test_metrics(labels, preds, trusts, trust_preds):
     }
 
 
-def evaluate_on_test(model, loader, test_df):
-    model.eval()
-    ce_loss_fn = nn.CrossEntropyLoss()
-    mse_loss_fn = nn.MSELoss()
+def evaluate_on_test(model, tokenizer, train_outputs, trust_config):
+    test_df = load_split(TEST_PATH, "test.jsonl")
+    test_loader = DataLoader(
+        HallucinationDataset(test_df, tokenizer),
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=0,
+    )
 
-    total_loss = 0.0
-    labels = []
-    preds = []
-    trusts = []
-    trust_preds = []
+    log("Running trust-aware test evaluation...")
+    outputs = run_model(model, test_loader)
+
+    probs = softmax_probs(
+        outputs["logits"], trust_config["temperature"]
+    )
+    preds = probs.argmax(axis=1)
+    uncertainties = predictive_entropy(probs)
+    neighbor_trust = neighbor_trust_scores(
+        outputs["features"],
+        train_outputs["features"],
+        train_outputs["labels"],
+        k=trust_config["neighbor_k"],
+    )
+    confidences = probs.max(axis=1)
+    abstain_mask = (
+        confidences <
+        trust_config["abstention"]["confidence_threshold"]
+    )
+    final_trust = compose_trust_score(
+        prob_not_hallucinated=probs[:, 0],
+        uncertainty=uncertainties,
+        neighbor_trust=neighbor_trust,
+        abstain_mask=abstain_mask,
+        weights=trust_config["weights"],
+    )
+
+    metrics = compute_test_metrics(
+        outputs["labels"],
+        preds,
+        test_df["trust_score"].to_numpy(dtype=np.float32),
+        final_trust,
+        probs,
+    )
+    metrics["mean_uncertainty"] = round(
+        float(uncertainties.mean()), 4
+    )
+    metrics["mean_neighbor_trust"] = round(
+        float(neighbor_trust.mean()), 4
+    )
+    metrics["mean_final_trust"] = round(
+        float(final_trust.mean()), 4
+    )
+    metrics["abstention_rate"] = round(
+        float(abstain_mask.mean()), 4
+    )
+    metrics["selective"] = compute_selective_accuracy(
+        outputs["labels"], preds, abstain_mask
+    )
+
     prediction_rows = []
-
-    start_time = torch.cuda.Event(enable_timing=True) \
-        if torch.cuda.is_available() else None
-    end_time = torch.cuda.Event(enable_timing=True) \
-        if torch.cuda.is_available() else None
-
-    if start_time is not None:
-        start_time.record()
-
-    with torch.no_grad():
-        sample_offset = 0
-        for batch in loader:
-            input_ids = batch["input_ids"].to(DEVICE)
-            attn_mask = batch["attention_mask"].to(DEVICE)
-            batch_labels = batch["label"].to(DEVICE)
-            batch_trusts = batch["trust_score"].to(DEVICE)
-
-            logits, batch_trust_preds = model(input_ids, attn_mask)
-
-            ce_loss = ce_loss_fn(logits, batch_labels)
-            mse_loss = mse_loss_fn(batch_trust_preds, batch_trusts)
-            loss = 0.7 * ce_loss + 0.3 * mse_loss
-            total_loss += loss.item()
-
-            batch_probs = torch.softmax(logits, dim=1)[:, 1]
-            batch_preds = torch.argmax(logits, dim=1)
-
-            labels_np = batch_labels.cpu().numpy()
-            preds_np = batch_preds.cpu().numpy()
-            probs_np = batch_probs.cpu().numpy()
-            trusts_np = batch_trusts.cpu().numpy()
-            trust_preds_np = batch_trust_preds.cpu().numpy()
-
-            labels.extend(labels_np)
-            preds.extend(preds_np)
-            trusts.extend(trusts_np)
-            trust_preds.extend(trust_preds_np)
-
-            batch_size = len(labels_np)
-            batch_df = test_df.iloc[sample_offset: sample_offset + batch_size]
-            for i, (_, row) in enumerate(batch_df.iterrows()):
-                prediction_rows.append({
-                    "question": row["question"],
-                    "answer": row["answer"],
-                    "difficulty": row.get("difficulty", "unknown"),
-                    "hallucination_type": row.get(
-                        "hallucination_type", "unknown"
-                    ),
-                    "label": int(labels_np[i]),
-                    "pred": int(preds_np[i]),
-                    "prob_hallucinated": float(probs_np[i]),
-                    "trust_score": float(trusts_np[i]),
-                    "predicted_trust_score": float(trust_preds_np[i]),
-                    "correct": bool(labels_np[i] == preds_np[i]),
-                })
-            sample_offset += batch_size
-
-    elapsed_seconds = None
-    if start_time is not None:
-        end_time.record()
-        torch.cuda.synchronize()
-        elapsed_seconds = start_time.elapsed_time(end_time) / 1000.0
-
-    metrics = compute_test_metrics(labels, preds, trusts, trust_preds)
-    metrics["loss"] = round(total_loss / len(loader), 4)
-    if elapsed_seconds is not None:
-        metrics["eval_time_s"] = round(elapsed_seconds, 2)
+    for idx, (_, row) in enumerate(test_df.iterrows()):
+        prediction_rows.append({
+            "question": row["question"],
+            "answer": row["answer"],
+            "matched_patient_uid": row["matched_patient_uid"],
+            "difficulty": row.get("difficulty", "unknown"),
+            "hallucination_type": row.get(
+                "hallucination_type", "unknown"
+            ),
+            "label": int(outputs["labels"][idx]),
+            "pred": int(preds[idx]),
+            "prob_hallucinated": float(probs[idx, 1]),
+            "prob_not_hallucinated": float(probs[idx, 0]),
+            "uncertainty": float(uncertainties[idx]),
+            "neighbor_trust": float(neighbor_trust[idx]),
+            "predicted_trust_score": float(final_trust[idx]),
+            "abstain_for_review": bool(abstain_mask[idx]),
+            "correct": bool(outputs["labels"][idx] == preds[idx]),
+        })
 
     return metrics, prediction_rows
 
@@ -213,8 +363,6 @@ def main():
             f"Best model not found at {BEST_MODEL_DIR}."
         )
 
-    test_df = load_test_split()
-
     log("Loading tokenizer + checkpoint...")
     tokenizer = AutoTokenizer.from_pretrained(BEST_MODEL_DIR)
     model = PatientAwareHallucinationDetector(
@@ -226,18 +374,12 @@ def main():
     model.load_state_dict(state_dict)
     model = model.to(DEVICE)
 
-    test_dataset = HallucinationDataset(test_df, tokenizer)
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=0,
-    )
-
-    log("Evaluating on test split...")
     wall_start = pd.Timestamp.now()
+    train_outputs, trust_config = prepare_trust_artifacts(
+        model, tokenizer
+    )
     metrics, predictions = evaluate_on_test(
-        model, test_loader, test_df
+        model, tokenizer, train_outputs, trust_config
     )
     wall_end = pd.Timestamp.now()
 
@@ -246,16 +388,17 @@ def main():
     )
 
     print("\n  Test summary:")
-    print(f"    Loss        : {metrics['loss']}")
-    print(f"    Accuracy    : {metrics['accuracy']}")
-    print(f"    F1          : {metrics['f1']}")
-    print(f"    Precision   : {metrics['precision']}")
-    print(f"    Recall      : {metrics['recall']}")
-    print(f"    Specificity : {metrics['specificity']}")
-    print(f"    Trust MAE   : {metrics['trust_mae']}")
-    print(f"    Trust RMSE  : {metrics['trust_rmse']}")
-    print(f"    Confusion   : {metrics['confusion_matrix']}")
-    print(f"    Time        : {metrics['wall_time']}")
+    print(f"    Accuracy          : {metrics['accuracy']}")
+    print(f"    F1                : {metrics['f1']}")
+    print(f"    ROC AUC           : {metrics['roc_auc']}")
+    print(f"    ECE               : {metrics['ece']}")
+    print(f"    Brier             : {metrics['brier']}")
+    print(f"    Trust MAE         : {metrics['trust_mae']}")
+    print(f"    Mean uncertainty  : {metrics['mean_uncertainty']}")
+    print(f"    Mean neighbor     : {metrics['mean_neighbor_trust']}")
+    print(f"    Abstention rate   : {metrics['abstention_rate']}")
+    print(f"    Selective results : {metrics['selective']}")
+    print(f"    Time              : {metrics['wall_time']}")
 
     save_results(metrics, predictions)
 

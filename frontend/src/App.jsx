@@ -256,6 +256,18 @@ export default function App() {
                 <strong>{result ? result.trust_score.toFixed(4) : "--"}</strong>
               </article>
               <article className="metric-card">
+                <span>Uncertainty</span>
+                <strong>{result ? formatPercent(result.uncertainty) : "--"}</strong>
+              </article>
+              <article className="metric-card">
+                <span>Neighbor Trust</span>
+                <strong>{result ? result.neighbor_trust.toFixed(4) : "--"}</strong>
+              </article>
+              <article className="metric-card">
+                <span>Review Flag</span>
+                <strong>{result ? (result.abstain_for_review ? "Review" : "Clear") : "--"}</strong>
+              </article>
+              <article className="metric-card">
                 <span>Runtime Device</span>
                 <strong>{result ? result.device : "--"}</strong>
               </article>
@@ -266,10 +278,15 @@ export default function App() {
               <p>
                 {result
                   ? result.is_hallucinated
-                    ? `This answer was flagged with ${formatPercent(result.hallucination_probability)} hallucination probability and a trust score of ${result.trust_score.toFixed(4)}.`
-                    : `This answer was accepted with ${formatPercent(result.confidence)} confidence and a trust score of ${result.trust_score.toFixed(4)}.`
-                  : "The backend will return a prediction label, confidence, and trust score after analysis."}
+                    ? `This answer was flagged with ${formatPercent(result.hallucination_probability)} hallucination probability, uncertainty ${formatPercent(result.uncertainty)}, and trust score ${result.trust_score.toFixed(4)}.`
+                    : `This answer was accepted with calibrated confidence ${formatPercent(result.calibrated_probability)} and trust score ${result.trust_score.toFixed(4)}.`
+                  : "The backend will return a calibrated prediction, uncertainty, neighbor trust, and final trust score after analysis."}
               </p>
+              {result ? (
+                <p>
+                  Signals: {result.explanation_tags.join(", ")}
+                </p>
+              ) : null}
             </div>
           </section>
         </main>

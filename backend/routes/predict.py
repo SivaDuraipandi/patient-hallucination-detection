@@ -20,6 +20,11 @@ class PredictionResponse(BaseModel):
     hallucination_probability: float
     confidence: float
     trust_score: float
+    uncertainty: float
+    neighbor_trust: float
+    calibrated_probability: float
+    abstain_for_review: bool
+    explanation_tags: list[str]
     device: str
     model_dir: str
 

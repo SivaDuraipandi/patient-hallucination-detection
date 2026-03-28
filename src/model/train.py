@@ -205,7 +205,7 @@ class PatientAwareHallucinationDetector(nn.Module):
             nn.Sigmoid()          # output in [0, 1]
         )
 
-    def forward(self, input_ids, attention_mask):
+    def forward(self, input_ids, attention_mask, return_features=False):
         # Encode — take [CLS] token (index 0)
         outputs = self.encoder(
             input_ids=input_ids,
@@ -219,6 +219,9 @@ class PatientAwareHallucinationDetector(nn.Module):
 
         # Head 2: trust score
         trust  = self.regressor(cls_output).squeeze(-1)
+
+        if return_features:
+            return logits, trust, cls_output
 
         return logits, trust
 
