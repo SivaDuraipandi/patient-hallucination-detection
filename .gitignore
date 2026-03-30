@@ -15,6 +15,9 @@ notebooks/
 
 data/raw/
 data/combined/
+!data/combined/
+data/combined/*
+!data/combined/match_review_sample.csv
 
 frontend/node_modules/
 frontend/dist/
