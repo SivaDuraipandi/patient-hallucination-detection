@@ -16,12 +16,14 @@ if MODEL_SRC_DIR not in sys.path:
     sys.path.insert(0, MODEL_SRC_DIR)
 
 from train import (  # noqa: E402
+    DEFAULT_INPUT_VARIANT,
     DEVICE,
     DROPOUT,
     MAX_LEN,
     OUTPUTS_DIR,
     PATIENT_CHARS,
     PatientAwareHallucinationDetector,
+    build_model_input,
 )
 from trust_utils import (  # noqa: E402
     compose_trust_score,
@@ -45,6 +47,7 @@ class InferenceService:
         self.model = None
         self.max_len = MAX_LEN
         self.patient_chars = PATIENT_CHARS
+        self.input_variant = DEFAULT_INPUT_VARIANT
         self.trust_config = {
             "temperature": 1.0,
             "neighbor_k": 15,
@@ -82,6 +85,11 @@ class InferenceService:
             self.patient_chars = int(
                 train_config.get("patient_chars", self.patient_chars)
             )
+            self.input_variant = str(
+                train_config.get(
+                    "input_variant", self.input_variant
+                )
+            ).strip().lower()
 
         if os.path.exists(TRUST_CONFIG_PATH):
             with open(TRUST_CONFIG_PATH, "r") as f:
@@ -109,10 +117,11 @@ class InferenceService:
         patient = str(patient_context or "")[:self.patient_chars]
         question = str(question or "")
         answer = str(answer or "")
-        text = (
-            f"patient: {patient} "
-            f"question: {question} "
-            f"answer: {answer}"
+        text = build_model_input(
+            patient,
+            question,
+            answer,
+            input_variant=self.input_variant,
         )
 
         encoding = self.tokenizer(

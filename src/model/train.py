@@ -25,6 +25,7 @@ Logs epoch metrics to logs/training_log.json
 import os
 import json
 import time
+import argparse
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -72,6 +73,16 @@ ALPHA         = 0.7    # weight for classification loss
 RANDOM_SEED   = 42
 PATIENT_CHARS = 500    # chars of patient context to include
 HEAD_HIDDEN   = 128
+INPUT_VARIANTS = {"patient_qa", "qa"}
+DEFAULT_INPUT_VARIANT = "patient_qa"
+INPUT_VARIANT = os.getenv(
+    "INPUT_VARIANT", DEFAULT_INPUT_VARIANT
+).strip().lower()
+if INPUT_VARIANT not in INPUT_VARIANTS:
+    raise ValueError(
+        f"Unsupported INPUT_VARIANT '{INPUT_VARIANT}'. "
+        f"Choose from {sorted(INPUT_VARIANTS)}."
+    )
 
 torch.manual_seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
@@ -110,6 +121,33 @@ def to_python_types(obj):
     return obj
 
 
+def build_model_input(
+    patient_context,
+    question,
+    answer,
+    input_variant=DEFAULT_INPUT_VARIANT,
+):
+    """Build the model input text for the selected ablation variant."""
+    input_variant = str(input_variant).strip().lower()
+    if input_variant not in INPUT_VARIANTS:
+        raise ValueError(
+            f"Unsupported input_variant '{input_variant}'. "
+            f"Choose from {sorted(INPUT_VARIANTS)}."
+        )
+
+    question = str(question or "")
+    answer = str(answer or "")
+    if input_variant == "qa":
+        return f"question: {question} answer: {answer}"
+
+    patient = str(patient_context or "")[:PATIENT_CHARS]
+    return (
+        f"patient: {patient} "
+        f"question: {question} "
+        f"answer: {answer}"
+    )
+
+
 # ─────────────────────────────────────────────────────────────
 # DATASET CLASS
 # ─────────────────────────────────────────────────────────────
@@ -125,10 +163,17 @@ class HallucinationDataset(Dataset):
       trust_score     : float (0.3 / 0.6 / 0.9 / 1.0)
     """
 
-    def __init__(self, df, tokenizer, max_len=MAX_LEN):
+    def __init__(
+        self,
+        df,
+        tokenizer,
+        max_len=MAX_LEN,
+        input_variant=INPUT_VARIANT,
+    ):
         self.df        = df.reset_index(drop=True)
         self.tokenizer = tokenizer
         self.max_len   = max_len
+        self.input_variant = input_variant
 
     def __len__(self):
         return len(self.df)
@@ -137,17 +182,16 @@ class HallucinationDataset(Dataset):
         row = self.df.iloc[idx]
 
         # Truncate patient context to keep input manageable
-        patient = str(
-            row.get("patient_context", "")
-        )[:PATIENT_CHARS]
+        patient = str(row.get("patient_context", ""))
         question = str(row.get("question", ""))
         answer   = str(row.get("answer", ""))
 
         # Build combined input text
-        text = (
-            f"patient: {patient} "
-            f"question: {question} "
-            f"answer: {answer}"
+        text = build_model_input(
+            patient,
+            question,
+            answer,
+            input_variant=self.input_variant,
         )
 
         # Tokenise
@@ -416,6 +460,7 @@ def save_checkpoint(model, tokenizer, epoch,
         "dropout"      : DROPOUT,
         "alpha"        : ALPHA,
         "patient_chars": PATIENT_CHARS,
+        "input_variant": INPUT_VARIANT,
     }
     checkpoint_meta = to_python_types(checkpoint_meta)
 
@@ -478,6 +523,7 @@ def train():
     print(f"  Epochs  : {EPOCHS}")
     print(f"  Batch   : {BATCH_SIZE}")
     print(f"  LR      : {LR}")
+    print(f"  Input   : {INPUT_VARIANT}")
     print(f"  Alpha   : {ALPHA} (CE) / "
           f"{1-ALPHA} (MSE)")
 
@@ -639,4 +685,13 @@ def train():
 # MAIN
 # ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--input-variant",
+        choices=sorted(INPUT_VARIANTS),
+        default=INPUT_VARIANT,
+        help="Use 'patient_qa' for the full model or 'qa' for the fast baseline.",
+    )
+    args = parser.parse_args()
+    INPUT_VARIANT = args.input_variant
     train()

@@ -39,6 +39,7 @@ from train import (
     OUTPUTS_DIR,
     SPLITS_DIR,
     HallucinationDataset,
+    DEFAULT_INPUT_VARIANT,
     PatientAwareHallucinationDetector,
     format_duration,
     log,
@@ -124,20 +125,24 @@ def run_model(model, loader):
     }
 
 
-def prepare_trust_artifacts(model, tokenizer):
+def prepare_trust_artifacts(model, tokenizer, input_variant):
     log("Preparing trust artifacts from train/validation splits...")
 
     train_df = load_split(TRAIN_PATH, "train.jsonl")
     val_df = load_split(VAL_PATH, "val.jsonl")
 
     train_loader = DataLoader(
-        HallucinationDataset(train_df, tokenizer),
+        HallucinationDataset(
+            train_df, tokenizer, input_variant=input_variant
+        ),
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=0,
     )
     val_loader = DataLoader(
-        HallucinationDataset(val_df, tokenizer),
+        HallucinationDataset(
+            val_df, tokenizer, input_variant=input_variant
+        ),
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=0,
@@ -255,10 +260,18 @@ def compute_test_metrics(labels, preds, trusts, trust_preds, probs):
     }
 
 
-def evaluate_on_test(model, tokenizer, train_outputs, trust_config):
+def evaluate_on_test(
+    model,
+    tokenizer,
+    train_outputs,
+    trust_config,
+    input_variant,
+):
     test_df = load_split(TEST_PATH, "test.jsonl")
     test_loader = DataLoader(
-        HallucinationDataset(test_df, tokenizer),
+        HallucinationDataset(
+            test_df, tokenizer, input_variant=input_variant
+        ),
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=0,
@@ -368,6 +381,15 @@ def main():
     model = PatientAwareHallucinationDetector(
         BEST_MODEL_DIR, dropout=DROPOUT
     )
+    config_path = os.path.join(BEST_MODEL_DIR, "train_config.json")
+    input_variant = DEFAULT_INPUT_VARIANT
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            train_config = json.load(f)
+        input_variant = train_config.get(
+            "input_variant", DEFAULT_INPUT_VARIANT
+        )
+    print(f"  Input mode  : {input_variant}")
 
     state_path = os.path.join(BEST_MODEL_DIR, "model_state.pt")
     state_dict = torch.load(state_path, map_location=DEVICE)
@@ -376,10 +398,14 @@ def main():
 
     wall_start = pd.Timestamp.now()
     train_outputs, trust_config = prepare_trust_artifacts(
-        model, tokenizer
+        model, tokenizer, input_variant
     )
     metrics, predictions = evaluate_on_test(
-        model, tokenizer, train_outputs, trust_config
+        model,
+        tokenizer,
+        train_outputs,
+        trust_config,
+        input_variant,
     )
     wall_end = pd.Timestamp.now()
 
